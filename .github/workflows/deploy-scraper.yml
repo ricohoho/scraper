@@ -1,0 +1,102 @@
+name: Deploy Scraper Application
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    name: 1. Build & Push Docker Image to GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-vps:
+    name: 2. Deploy Docker Image to VPS
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ vars.VPS_HOST || secrets.VPS_HOST }}
+          username: ${{ vars.VPS_USER || secrets.VPS_USER }}
+          key: ${{ secrets.VPS_KEY }}
+          port: ${{ vars.VPS_PORT || secrets.VPS_PORT || 22 }}
+          script: |
+            set -e
+
+            # Lowercase repository name for docker image tag
+            IMAGE_NAME=$(echo "ghcr.io/${{ github.repository }}:latest" | tr '[:upper:]' '[:lower:]')
+
+            echo "==> Authenticating to GHCR on VPS..."
+            if [ -n "${{ secrets.CR_PAT }}" ]; then
+              echo "${{ secrets.CR_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            elif [ -n "${{ secrets.GHCR_TOKEN }}" ]; then
+              echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            fi
+
+            echo "==> Pulling latest Docker image: $IMAGE_NAME..."
+            docker pull $IMAGE_NAME
+
+            echo "==> Stopping existing torrent-scraper container if running..."
+            docker stop torrent-scraper || true
+            docker rm torrent-scraper || true
+
+            echo "==> Creating persistent downloads directory..."
+            mkdir -p /opt/torrent-scraper/downloads
+
+            echo "==> Starting new torrent-scraper container..."
+            docker run -d \
+              --name torrent-scraper \
+              --restart unless-stopped \
+              -p 8765:8765 \
+              -v /opt/torrent-scraper/downloads:/app/downloads \
+              -e SCRAPER_HEADLESS=true \
+              -e SCRAPER_TMDB_BEARER_TOKEN="${{ secrets.SCRAPER_TMDB_BEARER_TOKEN }}" \
+              -e SCRAPER_TRANSMISSION_URL="${{ vars.SCRAPER_TRANSMISSION_URL || secrets.SCRAPER_TRANSMISSION_URL }}" \
+              -e SCRAPER_TRANSMISSION_USER="${{ secrets.SCRAPER_TRANSMISSION_USER }}" \
+              -e SCRAPER_TRANSMISSION_PASS="${{ secrets.SCRAPER_TRANSMISSION_PASS }}" \
+              -e SCRAPER_TRANSMISSION_DIR="${{ vars.SCRAPER_TRANSMISSION_DIR }}" \
+              $IMAGE_NAME
+
+            echo "==> Deployment finished successfully! Running containers:"
+            docker ps -f name=torrent-scraper

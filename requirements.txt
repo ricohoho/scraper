@@ -1,0 +1,3 @@
+# Installe le paquet local (src/scraper) et ses dépendances déclarées dans pyproject.toml.
+# Après installation, lancer une seule fois : python -m playwright install chromium
+-e .

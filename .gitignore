@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+downloads/
+*.torrent
+*.egg-info/
+build/
+dist/

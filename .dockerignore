@@ -1,0 +1,16 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+downloads/
+.env
+.env.local
+.pytest_cache
+.coverage
+htmlcov
+dist/
+build/
+*.egg-info/

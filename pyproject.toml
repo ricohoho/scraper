@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torrent-scraper"
+version = "0.1.0"
+description = "Scraper de liste de films (Playwright) avec gestion Cloudflare, prêt pour un backend."
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.44",
+    "pydantic-settings>=2.2",
+    "python-dotenv>=1.0",
+    "flask>=3.0",
+]
+
+[project.scripts]
+torrent-scraper = "scraper.cli:main"
+torrent-enrich  = "scraper.enrich_cli:main"
+torrent-serve     = "scraper.serve_cli:main"
+torrent-dashboard = "scraper.webapp_cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
