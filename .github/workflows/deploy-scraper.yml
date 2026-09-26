@@ -15,6 +15,7 @@ jobs:
   build-and-push:
     name: 1. Build & Push Docker Image to GHCR
     runs-on: ubuntu-latest
+    environment: production
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -52,6 +53,7 @@ jobs:
   deploy-vps:
     name: 2. Deploy Docker Image to VPS
     runs-on: ubuntu-latest
+    environment: production
     needs: build-and-push
     steps:
       - name: Deploy to VPS via SSH
