@@ -10,21 +10,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt-get/lists/*
 
-# Copy dependency definitions
-COPY pyproject.toml requirements.txt ./
+# Copy project specification and application source code
+COPY pyproject.toml requirements.txt README.md ./
+COPY src/ ./src/
 
 # Install python dependencies and local package
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir -e .
+    pip install --no-cache-dir .
 
 # Install Playwright browser binaries and OS dependencies
 RUN python -m playwright install-deps chromium && \
     python -m playwright install chromium
-
-# Copy application source code
-COPY src/ ./src/
-COPY README.md ./
 
 # Create output folder for downloads
 RUN mkdir -p downloads
