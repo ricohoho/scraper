@@ -31,7 +31,8 @@ Le processus de déploiement repose sur 3 composants principaux :
 ### 1. `Dockerfile`
 Fichier de construction de l'image Docker basée sur `python:3.11-slim` :
 - Installe les dépendances système nécessaires à **Playwright** (Chromium).
-- Installe les dépendances Python définies dans `pyproject.toml` et `requirements.txt`.
+- Copie le code source (`src/`) et les dépendances Python définies dans `pyproject.toml` et `requirements.txt`.
+- Installe le package local et ses dépendances via `pip install .`.
 - Installe le navigateur Chromium Playwright (`python -m playwright install-deps chromium`).
 - Expose le port HTTP `8765`.
 - Point d'entrée par défaut : `torrent-dashboard --host 0.0.0.0 --port 8765`.
@@ -50,7 +51,7 @@ Workflow GitHub Actions rattaché à l'environnement **`production`**, déclench
   - Se connecte en SSH au serveur VPS via `appleboy/ssh-action@v1.0.3`.
   - Effectue un `docker pull` de la nouvelle image depuis `ghcr.io`.
   - Arrête et supprime l'ancien conteneur `torrent-scraper` si présent.
-  - Crée le dossier hôte `/opt/torrent-scraper/downloads` pour la persistance des fichiers `.torrent`.
+  - Crée le dossier d'accueil hôte `~/torrent-scraper/downloads` pour la persistance des fichiers `.torrent`.
   - Lance le nouveau conteneur avec redirection de port `-p 8765:8765` et relancement automatique `--restart unless-stopped`.
 
 ---
@@ -64,15 +65,15 @@ Workflow GitHub Actions rattaché à l'environnement **`production`**, déclench
 
 ### 2. Configurer les Secrets et Variables dans l'Environnement `production`
 
-Une fois l'environnement **`production`** créé, ajoutez-y les secrets et variables :
-
 #### 🔐 Environment Secrets (Informations sensibles)
 
 | Nom du Secret | Description | Exemple |
 | :--- | :--- | :--- |
-| `VPS_KEY` | Clé privée SSH (format OpenSSH) autorisée sur le serveur VPS (`~/.ssh/authorized_keys`). | `-----BEGIN OPENSSH PRIVATE KEY-----...` |
-| `CR_PAT` *(ou `GHCR_TOKEN`)* | Jeton d'accès personnel GitHub (PAT) avec la portée `read:packages` (nécessaire si le dépôt/package GHCR est privé). | `ghp_xxxxxxxxxxxxxxxxxxxx` |
-| `SCRAPER_TMDB_BEARER_TOKEN` | Jeton d'authentification Bearer TMDB (API v4) pour l'enrichissement des données de films. | `eyJhbGciOiJIUzI1NiJ9...` |
+| `VPS_KEY` | Clé privée SSH (format OpenSSH) autorisée sur le serveur VPS. | `-----BEGIN OPENSSH PRIVATE KEY-----...` |
+| `VPS_PASSPHRASE` | Passphrase décodant la clé SSH privée `VPS_KEY` (si protégée par un mot de passe). | `MonMotDePasseCleSSH` |
+| `VPS_PASSWORD` | (Alternative) Mot de passe utilisateur SSH si connexion sans clé privée. | `MonMotDePasseSSH` |
+| `CR_PAT` *(ou `GHCR_TOKEN`)* | Jeton d'accès personnel GitHub (PAT) avec la portée `read:packages` (si dépôt privé). | `ghp_xxxxxxxxxxxxxxxxxxxx` |
+| `SCRAPER_TMDB_BEARER_TOKEN` | Jeton d'authentification Bearer TMDB (API v4) pour l'enrichissement. | `eyJhbGciOiJIUzI1NiJ9...` |
 | `SCRAPER_TRANSMISSION_USER` | Nom d'utilisateur pour la connexion RPC Transmission. | `admin` |
 | `SCRAPER_TRANSMISSION_PASS` | Mot de passe pour la connexion RPC Transmission. | `secretpassword` |
 

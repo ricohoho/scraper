@@ -62,6 +62,8 @@ jobs:
           host: ${{ vars.VPS_HOST || secrets.VPS_HOST }}
           username: ${{ vars.VPS_USER || secrets.VPS_USER }}
           key: ${{ secrets.VPS_KEY }}
+          passphrase: ${{ secrets.VPS_PASSPHRASE }}
+          password: ${{ secrets.VPS_PASSWORD }}
           port: ${{ vars.VPS_PORT || secrets.VPS_PORT || 22 }}
           script: |
             set -e
@@ -71,9 +73,9 @@ jobs:
 
             echo "==> Authenticating to GHCR on VPS..."
             if [ -n "${{ secrets.CR_PAT }}" ]; then
-              echo "${{ secrets.CR_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+              echo "${{ secrets.CR_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin || true
             elif [ -n "${{ secrets.GHCR_TOKEN }}" ]; then
-              echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+              echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin || true
             fi
 
             echo "==> Pulling latest Docker image: $IMAGE_NAME..."
@@ -83,15 +85,15 @@ jobs:
             docker stop torrent-scraper || true
             docker rm torrent-scraper || true
 
-            echo "==> Creating persistent downloads directory..."
-            mkdir -p /opt/torrent-scraper/downloads
+            echo "==> Creating persistent downloads directory in home directory..."
+            mkdir -p ~/torrent-scraper/downloads
 
             echo "==> Starting new torrent-scraper container..."
             docker run -d \
               --name torrent-scraper \
               --restart unless-stopped \
               -p 8765:8765 \
-              -v /opt/torrent-scraper/downloads:/app/downloads \
+              -v ~/torrent-scraper/downloads:/app/downloads \
               -e SCRAPER_HEADLESS=true \
               -e SCRAPER_TMDB_BEARER_TOKEN="${{ secrets.SCRAPER_TMDB_BEARER_TOKEN }}" \
               -e SCRAPER_TRANSMISSION_URL="${{ vars.SCRAPER_TRANSMISSION_URL || secrets.SCRAPER_TRANSMISSION_URL }}" \
