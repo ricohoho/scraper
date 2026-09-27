@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 
 def _matches(film: Film, settings: Settings) -> bool:
     """Critère métier : année 2025/2026 dans le titre ET taille connue < seuil."""
-    has_year = any(year in film.title for year in settings.years)
+    #has_year = any(year in film.title for year in settings.years)
+    has_year = True
     small_enough = film.size_gb is not None and film.size_gb < settings.max_size_gb
     return has_year and small_enough
 
