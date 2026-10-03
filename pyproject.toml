@@ -12,6 +12,7 @@ dependencies = [
     "pydantic-settings>=2.2",
     "python-dotenv>=1.0",
     "flask>=3.0",
+    "pyjwt>=2.8.0",
 ]
 
 [project.scripts]

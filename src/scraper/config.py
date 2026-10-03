@@ -1,4 +1,4 @@
-"""Configuration pilotée par variables d'environnement (préfixe ``SCRAPER_``).
+﻿"""Configuration pilotée par variables d'environnement (préfixe ``SCRAPER_``).
 
 Les valeurs peuvent venir de l'environnement ou d'un fichier ``.env`` à la racine.
 Voir ``.env.example`` pour la liste complète.
@@ -25,15 +25,12 @@ class Settings(BaseSettings):
     )
 
     # Site cible — changeable sans toucher au code.
-    #base_url: str = "https://ww1.lat/cpasbien/"
-    #base_url: str = "https://www.cpasbien2.cc/home"
-    base_url:   str = "https://www.cpasbien2.cc/category/films"
+    base_url: str = "https://www.cpasbien2.cc/category/films"
 
     # Navigateur visible par défaut (aide à franchir Cloudflare et à déboguer).
     headless: bool = False
 
-    # Chemin de la page « liste complète des films » (relatif au domaine courant,
-    # résolu après les redirections). Sur cpasbien : lien « Voir tous les Films ».
+    # Chemin de la page « liste complète des films » (relatif au domaine courant).
     list_path: str = "/category/films"
 
     # Limites et critères de filtrage.
@@ -41,12 +38,9 @@ class Settings(BaseSettings):
     max_size_gb: float = 5.0
 
     # Années recherchées dans le titre, sous forme brute « 2025,2026 ».
-    # Stocké en str pour éviter le décodage JSON de pydantic-settings sur les listes.
     years_raw: str = Field(default="2025,2026", alias="SCRAPER_YEARS")
 
-    # Domaines tiers supplémentaires à autoriser (séparés par des virgules), en plus
-    # du domaine de `base_url`. Utile quand le site redirige vers un autre domaine
-    # « maison » (ex. une passerelle ww1.lat -> cpasbien.fyi). Les ads restent bloquées.
+    # Domaines tiers supplémentaires à autoriser.
     allowed_domains_raw: str = Field(default="", alias="SCRAPER_ALLOWED_DOMAINS")
 
     # Sortie.
@@ -68,6 +62,12 @@ class Settings(BaseSettings):
     # Délais (millisecondes).
     nav_timeout_ms: int = 45_000
     request_delay_ms: int = 1_000
+
+    # Authentification Web (JWT) & Sécurité.
+    admin_user: str = "admin"
+    admin_pass: str = "admin"
+    jwt_secret: str = "torrent-scraper-secret-key-change-me"
+    jwt_expires_hours: int = 24
 
     @property
     def years(self) -> list[str]:

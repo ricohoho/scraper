@@ -1,12 +1,16 @@
-"""Dashboard web Flask — Scraping, Films, Transmission."""
+﻿"""Dashboard web Flask — Scraping, Films, Transmission, Authentification JWT."""
 
 from __future__ import annotations
 
 import base64
+import datetime
+import hashlib
+import hmac
 import json
 import logging
 import queue
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -18,11 +22,87 @@ from .enrichment import enrich_report
 from .html_report import serve_html
 from .naming import sanitize_filename
 from .pipeline import run as pipeline_run
-from .server import _update_json  # réutilise la fonction thread-safe existante
+from .server import _update_json
 
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Helpers JWT (PyJWT avec fallback stdlib hmac/hashlib/base64)
+# ---------------------------------------------------------------------------
+
+def _create_jwt(payload: dict, secret: str) -> str:
+    try:
+        import jwt as pyjwt
+        return pyjwt.encode(payload, secret, algorithm="HS256")
+    except ImportError:
+        header = {"alg": "HS256", "typ": "JWT"}
+        def _b64e(b: bytes) -> str:
+            return base64.urlsafe_b64encode(b).rstrip(b'=').decode('ascii')
+        h_b64 = _b64e(json.dumps(header, separators=(',', ':')).encode('utf-8'))
+        p_b64 = _b64e(json.dumps(payload, separators=(',', ':')).encode('utf-8'))
+        sig_input = f"{h_b64}.{p_b64}".encode('utf-8')
+        sig = hmac.new(secret.encode('utf-8'), sig_input, hashlib.sha256).digest()
+        return f"{h_b64}.{p_b64}.{_b64e(sig)}"
+
+
+def _verify_jwt(token: str, secret: str) -> dict | None:
+    try:
+        import jwt as pyjwt
+        return pyjwt.decode(token, secret, algorithms=["HS256"])
+    except Exception:
+        pass
+    try:
+        parts = token.split('.')
+        if len(parts) != 3:
+            return None
+        h_b64, p_b64, s_b64 = parts
+        sig_input = f"{h_b64}.{p_b64}".encode('utf-8')
+        expected_sig = hmac.new(secret.encode('utf-8'), sig_input, hashlib.sha256).digest()
+        pad_s = '=' * ((4 - len(s_b64) % 4) % 4)
+        actual_sig = base64.urlsafe_b64decode((s_b64 + pad_s).encode('ascii'))
+        if not hmac.compare_digest(expected_sig, actual_sig):
+            return None
+        pad_p = '=' * ((4 - len(p_b64) % 4) % 4)
+        payload_raw = base64.urlsafe_b64decode((p_b64 + pad_p).encode('ascii'))
+        payload = json.loads(payload_raw.decode('utf-8'))
+        if "exp" in payload and time.time() > payload["exp"]:
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _get_request_token() -> str | None:
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    if "token" in request.args:
+        return request.args.get("token")
+    return request.cookies.get("jwt_token")
+
+
+# ---------------------------------------------------------------------------
+# Middlewares & Sécurité
+# ---------------------------------------------------------------------------
+
+PUBLIC_PATHS = {"/api/login", "/favicon.ico"}
+
+@app.before_request
+def _enforce_security():
+    if request.method == "OPTIONS":
+        return None
+    if request.path in PUBLIC_PATHS or request.path.startswith("/static/"):
+        return None
+    
+    # Sécurise toutes les routes API et actions sensibles
+    if request.path.startswith("/api/") or request.path.startswith("/select") or request.path.startswith("/films/"):
+        token = _get_request_token()
+        cfg = Settings()
+        if not token or not _verify_jwt(token, cfg.jwt_secret):
+            return jsonify({"error": "Authentification requise", "code": "UNAUTHORIZED"}), 401
+
 
 # ---------------------------------------------------------------------------
 # État global du job (un seul job à la fois)
@@ -31,7 +111,6 @@ app = Flask(__name__)
 _job_lock = threading.Lock()
 _job = {"status": "idle", "queue": queue.Queue()}
 
-# Dernier rapport JSON actif (mis à jour après chaque scraping)
 _active_report: Path | None = None
 _active_report_lock = threading.Lock()
 
@@ -48,12 +127,43 @@ def _get_active_report() -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# Routes — Dashboard HTML
+# Routes — Authentification & Dashboard
 # ---------------------------------------------------------------------------
 
 @app.route("/")
 def index():
     return _DASHBOARD_HTML
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.json or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+    cfg = Settings()
+
+    if username == cfg.admin_user and password == cfg.admin_pass:
+        now = int(time.time())
+        exp = now + (cfg.jwt_expires_hours * 3600)
+        payload = {"sub": username, "iat": now, "exp": exp}
+        token = _create_jwt(payload, cfg.jwt_secret)
+        return jsonify({
+            "ok": True,
+            "token": token,
+            "username": username,
+            "expires_in": cfg.jwt_expires_hours * 3600
+        })
+    return jsonify({"ok": False, "error": "Identifiant ou mot de passe incorrect"}), 401
+
+
+@app.route("/api/me")
+def api_me():
+    token = _get_request_token()
+    cfg = Settings()
+    payload = _verify_jwt(token, cfg.jwt_secret) if token else None
+    if payload:
+        return jsonify({"authenticated": True, "username": payload.get("sub")})
+    return jsonify({"authenticated": False}), 401
 
 
 @app.route("/api/config")
@@ -75,7 +185,6 @@ def get_config():
         "transmission_dir":  cfg.transmission_dir,
     })
 
-
 # ---------------------------------------------------------------------------
 # Routes — API Scraping
 # ---------------------------------------------------------------------------
@@ -84,49 +193,88 @@ def get_config():
 def scrape_start():
     with _job_lock:
         if _job["status"] == "running":
-            return jsonify({"error": "Un job est déjà en cours."}), 409
+            return jsonify({"error": "Un job est déjà en cours"}), 409
+
+        body = request.json or {}
+        cfg = Settings()
+
+        overrides = {
+            "base_url":          body.get("base_url") or cfg.base_url,
+            "max_films":         int(body.get("max_films", cfg.max_films)),
+            "years_raw":         body.get("years") if body.get("years") is not None else cfg.years_raw,
+            "output_dir":        body.get("output_dir") or cfg.output_dir,
+            "headless":          bool(body.get("headless", cfg.headless)),
+            "rico_api_url":      body.get("rico_api_url") or cfg.rico_api_url,
+            "tmdb_bearer_token": body.get("tmdb_bearer_token") or cfg.tmdb_bearer_token,
+            "tmdb_api_key":      body.get("tmdb_api_key") or cfg.tmdb_api_key,
+        }
+
+        q = queue.Queue()
         _job["status"] = "running"
-        _job["queue"] = queue.Queue()
+        _job["queue"] = q
 
-    body = request.json or {}
-    settings = Settings()
-    if body.get("base_url"):      settings.base_url     = body["base_url"]
-    if body.get("max_films"):     settings.max_films    = int(body["max_films"])
-    if body.get("years"):         settings.years_raw    = body["years"]
-    if body.get("max_size_gb"):   settings.max_size_gb  = float(body["max_size_gb"])
-    if body.get("output_dir"):    settings.output_dir   = body["output_dir"]
-    if "headless" in body:        settings.headless     = bool(body["headless"])
-    if body.get("tmdb_bearer_token"): settings.tmdb_bearer_token = body["tmdb_bearer_token"]
-    if body.get("tmdb_api_key"):  settings.tmdb_api_key = body["tmdb_api_key"]
-    if body.get("rico_api_url"):  settings.rico_api_url = body["rico_api_url"]
+        def _worker():
+            def log_cb(text: str, level: str = "info"):
+                q.put({"type": "log", "text": text, "level": level})
 
-    q = _job["queue"]
+            try:
+                log_cb("Initialisation du scraping...", "info")
+                active_cfg = Settings(**overrides)
 
-    def _run():
-        try:
-            result = pipeline_run(settings, progress=q.put)
-            report_path = Path(settings.output_dir) / _find_latest_json(settings.output_dir)
-            _set_active_report(report_path)
-            q.put({"type": "enriching", "message": "Enrichissement Rico + TMDB en cours…"})
-            enrich_report(report_path, settings)
-            q.put({"type": "all_done",
-                   "report": report_path.name,
-                   "downloaded": result.downloaded_count})
-        except Exception as exc:
-            logger.exception("Erreur dans le job de scraping")
-            q.put({"type": "error", "message": str(exc)})
-        finally:
-            with _job_lock:
-                _job["status"] = "idle"
+                def pipeline_log(msg: str):
+                    log_cb(msg, "info")
 
-    threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"ok": True})
+                pipeline_run(
+                    base_url=active_cfg.base_url,
+                    list_path=active_cfg.list_path,
+                    years=active_cfg.years,
+                    allowed_domains=active_cfg.allowed_domains,
+                    max_films=active_cfg.max_films,
+                    max_size_gb=active_cfg.max_size_gb,
+                    output_dir=active_cfg.output_dir,
+                    headless=active_cfg.headless,
+                    nav_timeout_ms=active_cfg.nav_timeout_ms,
+                    request_delay_ms=active_cfg.request_delay_ms,
+                    log_cb=pipeline_log,
+                )
+
+                log_cb("Scraping terminé. Recherche du fichier JSON généré...", "info")
+                json_name = _find_latest_json(active_cfg.output_dir)
+                json_path = Path(active_cfg.output_dir) / json_name
+                log_cb(f"Enrichissement du rapport : {json_name}...", "info")
+
+                def enrich_log(msg: str):
+                    log_cb(msg, "info")
+
+                enrich_report(
+                    json_path=json_path,
+                    rico_api_url=active_cfg.rico_api_url,
+                    tmdb_bearer_token=active_cfg.tmdb_bearer_token,
+                    tmdb_api_key=active_cfg.tmdb_api_key,
+                    log_cb=enrich_log,
+                )
+
+                _set_active_report(json_path)
+                log_cb(f"Traitement terminé avec succès ! Rapport : {json_name}", "success")
+                q.put({"type": "all_done", "report_name": json_name})
+            except Exception as exc:
+                logger.exception("Erreur durant le scraping")
+                log_cb(f"ERREUR : {exc}", "error")
+                q.put({"type": "error", "error": str(exc)})
+            finally:
+                with _job_lock:
+                    _job["status"] = "idle"
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        return jsonify({"ok": True, "message": "Job démarré"})
 
 
 @app.route("/api/scrape/progress")
 def scrape_progress():
+    q = _job["queue"]
+
     def generate():
-        q = _job["queue"]
         while True:
             try:
                 msg = q.get(timeout=30)
@@ -141,7 +289,6 @@ def scrape_progress():
 
 
 def _find_latest_json(output_dir: str) -> str:
-    """Retourne le nom du fichier JSON le plus récent dans output_dir."""
     files = sorted(Path(output_dir).glob("scraping-cpasbien-*.json"), key=lambda p: p.stat().st_mtime)
     if not files:
         raise RuntimeError("Aucun fichier JSON trouvé après le scraping.")
@@ -196,7 +343,6 @@ def serve_report(name: str):
 
 @app.route("/api/report-json/<name>")
 def get_report_json(name: str):
-    """Renvoie le contenu brut du JSON pour un rapport donné, avec torrent_ok par entrée."""
     cfg = Settings()
     output_dir = Path(cfg.output_dir)
     path = output_dir / name
@@ -250,14 +396,13 @@ def transmission_send():
     trans_user = body.get("user", cfg.transmission_user)
     trans_pass = body.get("pass", cfg.transmission_pass)
     trans_dir  = body.get("dir",  cfg.transmission_dir)
-    films      = body.get("films", [])  # liste de valeurs "film" (titre nettoyé)
+    films      = body.get("films", [])
 
     if not films:
         return jsonify({"error": "Aucun film sélectionné"}), 400
 
     output_dir = Path(cfg.output_dir)
 
-    # Construire un index film_name → Fichier à partir du rapport actif
     fichier_by_film: dict[str, str] = {}
     active = _get_active_report()
     if active and active.exists():
@@ -285,12 +430,7 @@ def transmission_send():
     return jsonify({"results": results})
 
 
-# ---------------------------------------------------------------------------
-# Transmission RPC (urllib stdlib)
-# ---------------------------------------------------------------------------
-
 def _transmission_session_id(base_url: str, user: str, pwd: str) -> str:
-    """Obtient le X-Transmission-Session-Id en déclenchant un 409."""
     rpc_url = base_url.rstrip("/") + "/transmission/rpc"
     req = urllib.request.Request(rpc_url, data=b"{}", method="POST")
     req.add_header("Content-Type", "application/json")
@@ -299,7 +439,7 @@ def _transmission_session_id(base_url: str, user: str, pwd: str) -> str:
         req.add_header("Authorization", f"Basic {creds}")
     try:
         urllib.request.urlopen(req, timeout=8)
-        return ""  # 200 sans session-id (rare)
+        return ""
     except urllib.error.HTTPError as exc:
         if exc.code == 409:
             return exc.headers.get("X-Transmission-Session-Id", "")
@@ -309,7 +449,6 @@ def _transmission_session_id(base_url: str, user: str, pwd: str) -> str:
 
 
 def _send_torrent(torrent_path: Path, base_url: str, user: str, pwd: str, dest_dir: str) -> dict:
-    """Envoie un fichier .torrent à Transmission via JSON-RPC."""
     session_id = _transmission_session_id(base_url, user, pwd)
     rpc_url = base_url.rstrip("/") + "/transmission/rpc"
 
@@ -337,7 +476,7 @@ def _send_torrent(torrent_path: Path, base_url: str, user: str, pwd: str, dest_d
 
 
 # ---------------------------------------------------------------------------
-# Dashboard HTML (inline)
+# Dashboard HTML (inline avec Modal Login JWT)
 # ---------------------------------------------------------------------------
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
@@ -345,444 +484,579 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Torrent Scraper Dashboard</title>
+  <title>Torrent Scraper — Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f0f14; color: #e2e2e8; min-height: 100vh; }
-
-    /* Header + tabs */
-    header { background: #16161f; border-bottom: 1px solid #2a2a38; padding: .75rem 1.5rem; display: flex; align-items: center; gap: 2rem; position: sticky; top: 0; z-index: 100; }
-    header h1 { font-size: 1.2rem; color: #a78bfa; white-space: nowrap; }
-    .tabs { display: flex; gap: .25rem; }
-    .tab-btn { background: none; border: none; color: #6b7280; padding: .5rem 1rem; border-radius: 6px; cursor: pointer; font-size: .9rem; font-weight: 600; transition: all .15s; }
-    .tab-btn:hover { background: #1c1c27; color: #c4c4d4; }
-    .tab-btn.active { background: #2e1e6b; color: #a78bfa; }
-
-    /* Panels */
-    .tab-pane { display: none; padding: 1.5rem; max-width: 1000px; margin: 0 auto; }
-    .tab-pane.active { display: block; }
-
-    /* Forms */
-    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem 1.5rem; margin-bottom: 1rem; }
-    .form-group { display: flex; flex-direction: column; gap: .3rem; }
-    .form-group label { font-size: .8rem; color: #6b7280; font-weight: 600; }
-    .form-group input, .form-group select { background: #1c1c27; border: 1px solid #2a2a38; color: #e2e2e8; padding: .45rem .7rem; border-radius: 6px; font-size: .9rem; width: 100%; }
-    .form-group input:focus, .form-group select:focus { outline: none; border-color: #7c3aed; }
-    .form-group.full { grid-column: 1 / -1; }
-    .checkbox-row { display: flex; align-items: center; gap: .5rem; margin-bottom: 1rem; }
-    .checkbox-row input { width: auto; accent-color: #7c3aed; }
-    .checkbox-row label { font-size: .9rem; color: #c4c4d4; }
-
-    /* Buttons */
-    .btn { display: inline-flex; align-items: center; gap: .4rem; padding: .55rem 1.2rem; border-radius: 8px; border: none; cursor: pointer; font-size: .9rem; font-weight: 600; transition: background .15s; }
-    .btn-primary { background: #7c3aed; color: #fff; }
-    .btn-primary:hover { background: #6d28d9; }
-    .btn-secondary { background: #2a2a38; color: #c4c4d4; }
-    .btn-secondary:hover { background: #3a3a50; }
-    .btn-danger { background: #7f1d1d; color: #fca5a5; }
-    .btn-danger:hover { background: #991b1b; }
-    .btn:disabled { opacity: .5; cursor: not-allowed; }
-
-    /* Section titles */
-    h2 { font-size: 1rem; color: #a78bfa; margin-bottom: 1rem; padding-bottom: .5rem; border-bottom: 1px solid #2a2a38; }
-    .section { margin-bottom: 2rem; }
-
-    /* Progress log */
-    #progress-log { background: #0a0a0f; border: 1px solid #2a2a38; border-radius: 8px; padding: .75rem; min-height: 120px; max-height: 320px; overflow-y: auto; font-family: monospace; font-size: .82rem; margin-top: 1rem; }
-    .log-line { padding: .15rem 0; border-bottom: 1px solid #16161f; display: flex; gap: .6rem; align-items: baseline; }
-    .log-line:last-child { border-bottom: none; }
-    .log-ok    { color: #6ee7b7; }
-    .log-err   { color: #fca5a5; }
-    .log-info  { color: #93c5fd; }
-    .log-dim   { color: #4b5563; }
-
-    /* Report selector */
-    .report-bar { display: flex; gap: .75rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
-    .report-bar select { flex: 1; min-width: 200px; background: #1c1c27; border: 1px solid #2a2a38; color: #e2e2e8; padding: .45rem .7rem; border-radius: 6px; font-size: .9rem; }
-
-    /* Films iframe */
-    #films-frame { width: 100%; height: calc(100vh - 200px); border: 1px solid #2a2a38; border-radius: 8px; background: #0f0f14; }
-
-    /* Transmission — selected films list */
-    #trans-films-list { margin-top: 1rem; display: flex; flex-direction: column; gap: .4rem; max-height: 320px; overflow-y: auto; }
-    .trans-film { display: flex; justify-content: space-between; align-items: center; background: #1c1c27; border: 1px solid #2a2a38; border-radius: 6px; padding: .5rem .8rem; font-size: .85rem; }
-    .trans-film.sent  { border-color: #064e3b; background: #052e1a; }
-    .trans-film.error { border-color: #7f1d1d; background: #2a0a0a; }
-    .trans-film.trans-film-missing { border-color: #78350f; background: #1c120a; opacity: .7; }
-    .trans-film span.name { color: #f3f3f8; }
-    .trans-film span.status { font-size: .75rem; color: #6b7280; }
-
-    /* Toast */
-    #toast { position: fixed; bottom: 1.5rem; right: 1.5rem; padding: .6rem 1.2rem; border-radius: 8px; font-size: .85rem; font-weight: 600; opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 999; }
-    #toast.ok    { background: #064e3b; color: #6ee7b7; }
-    #toast.error { background: #7f1d1d; color: #fca5a5; }
-    #toast.show  { opacity: 1; }
-
-    /* Badges */
-    .badge { display: inline-block; padding: .15rem .55rem; border-radius: 999px; font-size: .75rem; font-weight: 600; }
-    .badge-idle    { background: #1c1c27; color: #6b7280; }
-    .badge-running { background: #1e3a5f; color: #60a5fa; }
-    .badge-done    { background: #064e3b; color: #6ee7b7; }
-
-    @media (max-width: 600px) {
-      .form-grid { grid-template-columns: 1fr; }
-      header { flex-direction: column; align-items: flex-start; gap: .5rem; }
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --card-border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --success: #10b981;
+      --error: #ef4444;
+      --warning: #f59e0b;
+      --radius: 12px;
     }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', system-ui, sans-serif; }
+    body { background: var(--bg); color: var(--text); min-height: 100vh; padding: 24px; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    
+    /* Header & Navigation */
+    header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--card-border); }
+    h1 { font-size: 1.5rem; font-weight: 700; background: linear-gradient(135deg, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .user-badge { display: flex; align-items: center; gap: 12px; font-size: 0.9rem; color: var(--muted); background: rgba(30, 41, 59, 0.6); padding: 6px 14px; border-radius: 20px; border: 1px solid var(--card-border); }
+    .user-badge strong { color: var(--text); }
+    
+    /* Buttons & Inputs */
+    .btn { padding: 8px 16px; border-radius: 8px; border: none; font-weight: 600; cursor: pointer; transition: all 0.2s ease; display: inline-flex; align-items: center; gap: 8px; }
+    .btn-primary { background: linear-gradient(135deg, #3b82f6, #6366f1); color: white; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3); }
+    .btn-primary:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(59, 130, 246, 0.4); }
+    .btn-danger { background: var(--error); color: white; }
+    .btn-outline { background: transparent; border: 1px solid var(--card-border); color: var(--text); }
+    .btn-outline:hover { background: var(--card); border-color: var(--muted); }
+    .btn-sm { padding: 4px 10px; font-size: 0.82rem; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    
+    /* Tabs */
+    .nav-tabs { display: flex; gap: 8px; margin-bottom: 24px; border-bottom: 1px solid var(--card-border); padding-bottom: 8px; }
+    .tab-btn { background: transparent; border: none; color: var(--muted); padding: 8px 16px; font-weight: 500; border-radius: 8px; cursor: pointer; transition: all 0.2s; }
+    .tab-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+    .tab-btn.active { color: white; background: var(--accent); }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+    
+    /* Forms & Cards */
+    .card { background: var(--card); border: 1px solid var(--card-border); border-radius: var(--radius); padding: 24px; margin-bottom: 24px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .form-group { margin-bottom: 16px; }
+    label { display: block; font-size: 0.85rem; font-weight: 500; color: var(--muted); margin-bottom: 6px; }
+    input[type="text"], input[type="password"], input[type="number"], select { width: 100%; padding: 10px 14px; background: #0f172a; border: 1px solid var(--card-border); border-radius: 8px; color: var(--text); outline: none; transition: border-color 0.2s; }
+    input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2); }
+    .checkbox-group { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    
+    /* Log console */
+    .log-container { background: #090d16; border: 1px solid var(--card-border); border-radius: 8px; padding: 16px; font-family: monospace; font-size: 0.85rem; height: 320px; overflow-y: auto; color: #a7f3d0; margin-top: 16px; }
+    .log-line { margin-bottom: 4px; word-break: break-all; }
+    .log-error { color: #fca5a5; }
+    .log-success { color: #6ee7b7; font-weight: 600; }
+    
+    /* Glassmorphism Login Modal */
+    .modal-overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(16px); display: flex; align-items: center; justify-content: center; z-index: 9999; opacity: 0; pointer-events: none; transition: opacity 0.3s ease; }
+    .modal-overlay.active { opacity: 1; pointer-events: auto; }
+    .login-box { background: rgba(30, 41, 59, 0.95); border: 1px solid rgba(255, 255, 255, 0.1); box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7), 0 0 30px rgba(59, 130, 246, 0.25); border-radius: 16px; padding: 36px; width: 100%; max-width: 420px; text-align: center; }
+    .login-box h2 { font-size: 1.6rem; font-weight: 700; margin-bottom: 8px; background: linear-gradient(135deg, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .login-box p { color: var(--muted); font-size: 0.9rem; margin-bottom: 24px; }
+    .login-box .form-group { text-align: left; }
+    .login-box .btn-primary { width: 100%; padding: 12px; justify-content: center; font-size: 1rem; margin-top: 12px; }
+    .error-alert { background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3); color: #fca5a5; padding: 10px; border-radius: 8px; font-size: 0.85rem; margin-bottom: 16px; display: none; }
+    
+    /* Toast */
+    #toast { position: fixed; bottom: 24px; right: 24px; padding: 12px 20px; border-radius: 8px; background: var(--card); border: 1px solid var(--card-border); box-shadow: 0 10px 25px rgba(0,0,0,0.5); z-index: 10000; opacity: 0; transform: translateY(20px); transition: all 0.3s ease; pointer-events: none; }
+    #toast.show { opacity: 1; transform: translateY(0); }
+    #toast.ok { border-color: var(--success); color: #6ee7b7; }
+    #toast.error { border-color: var(--error); color: #fca5a5; }
+    
+    /* Report iframe container */
+    iframe { width: 100%; height: 750px; border: none; border-radius: 8px; background: white; }
+    .report-selector { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
   </style>
 </head>
 <body>
-<header>
-  <h1>🎬 Torrent Scraper</h1>
-  <nav class="tabs">
-    <button class="tab-btn active" data-tab="scraping">⚙️ Scraping</button>
-    <button class="tab-btn" data-tab="films">🎥 Films</button>
-    <button class="tab-btn" data-tab="transmission">📡 Transmission</button>
-  </nav>
-  <span id="job-badge" class="badge badge-idle">Inactif</span>
-</header>
 
-<!-- ═══════════════════════ TAB 1 — SCRAPING ═══════════════════════ -->
-<section id="tab-scraping" class="tab-pane active">
-  <div class="section">
-    <h2>Paramètres</h2>
-    <div class="form-grid">
-      <div class="form-group full">
-        <label>URL cible</label>
-        <input id="p-base-url" type="url">
-      </div>
-      <div class="form-group">
-        <label>Nb max de films</label>
-        <input id="p-max-films" type="number" min="1">
-      </div>
-      <div class="form-group">
-        <label>Taille max (Go)</label>
-        <input id="p-max-size" type="number" step="0.5" min="0.5">
-      </div>
-      <div class="form-group">
-        <label>Années recherchées</label>
-        <input id="p-years" type="text" placeholder="2025,2026">
-      </div>
-      <div class="form-group">
-        <label>Dossier de sortie</label>
-        <input id="p-output-dir" type="text">
-      </div>
-      <div class="form-group">
-        <label>URL Rico</label>
-        <input id="p-rico-url" type="url">
-      </div>
-      <div class="form-group">
-        <label>TMDB Bearer Token</label>
-        <input id="p-tmdb-token" type="password">
-      </div>
-      <div class="form-group">
-        <label>TMDB API Key</label>
-        <input id="p-tmdb-key" type="text">
-      </div>
+  <!-- Modal Authentification JWT -->
+  <div id="login-modal" class="modal-overlay">
+    <div class="login-box">
+      <h2>🔐 Connexion</h2>
+      <p>Accès sécurisé au Dashboard Torrent Scraper</p>
+      <div id="login-error" class="error-alert"></div>
+      <form id="form-login">
+        <div class="form-group">
+          <label for="login-username">Utilisateur</label>
+          <input type="text" id="login-username" placeholder="ex: admin" required autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label for="login-password">Mot de passe</label>
+          <input type="password" id="login-password" placeholder="••••••••" required autocomplete="current-password">
+        </div>
+        <button type="submit" id="btn-login-submit" class="btn btn-primary">Se connecter 🚀</button>
+      </form>
     </div>
-    <div class="checkbox-row">
-      <input id="p-headless" type="checkbox">
-      <label for="p-headless">Mode headless (sans fenêtre navigateur)</label>
-    </div>
-    <button id="btn-start" class="btn btn-primary">▶ Lancer le scraping</button>
-    <button id="btn-stop" class="btn btn-danger" style="display:none">⏹ Arrêter</button>
   </div>
 
-  <div class="section">
-    <h2>Progression</h2>
-    <div id="progress-log"><span class="log-dim">En attente du lancement…</span></div>
-  </div>
-</section>
-
-<!-- ═══════════════════════ TAB 2 — FILMS ═══════════════════════ -->
-<section id="tab-films" class="tab-pane">
-  <div class="report-bar">
-    <select id="report-select"><option value="">— Sélectionner un rapport —</option></select>
-    <button id="btn-load-report" class="btn btn-primary">📂 Ouvrir</button>
-    <button id="btn-refresh-reports" class="btn btn-secondary">↺ Actualiser</button>
-  </div>
-  <iframe id="films-frame" src="about:blank" title="Rapport films"></iframe>
-</section>
-
-<!-- ═══════════════════════ TAB 3 — TRANSMISSION ═══════════════════════ -->
-<section id="tab-transmission" class="tab-pane">
-  <div class="section">
-    <h2>Connexion Transmission</h2>
-    <div class="form-grid">
-      <div class="form-group full">
-        <label>URL du serveur</label>
-        <input id="t-url" type="url" placeholder="http://ricohoho.fr:9091">
+  <div class="container">
+    <header>
+      <h1>🎬 Torrent Scraper Dashboard</h1>
+      <div id="user-badge" class="user-badge" style="display:none;">
+        👤 <strong id="logged-user">admin</strong>
+        <button id="btn-logout" class="btn btn-sm btn-outline">Déconnexion</button>
       </div>
-      <div class="form-group">
-        <label>Utilisateur</label>
-        <input id="t-user" type="text">
+    </header>
+
+    <nav class="nav-tabs">
+      <button class="tab-btn active" data-tab="scraping">⚡ Scraping</button>
+      <button class="tab-btn" data-tab="reports">📊 Rapports Films</button>
+      <button class="tab-btn" data-tab="transmission">📡 Transmission</button>
+    </nav>
+
+    <!-- TAB 1 : SCRAPING -->
+    <section id="tab-scraping" class="tab-pane active">
+      <div class="card">
+        <h2>Lancer un nouveau Scraping</h2>
+        <div class="grid-2" style="margin-top: 16px;">
+          <div class="form-group">
+            <label>URL du site cible</label>
+            <input type="text" id="p-base-url" placeholder="https://www.cpasbien2.cc/category/films">
+          </div>
+          <div class="form-group">
+            <label>Nombre max de films</label>
+            <input type="number" id="p-max-films" value="100">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="form-group">
+            <label>Années recherchées (séparées par virgule)</label>
+            <input type="text" id="p-years" value="2025,2026">
+          </div>
+          <div class="form-group">
+            <label>Dossier de sortie (.torrent)</label>
+            <input type="text" id="p-output-dir" value="downloads">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="form-group">
+            <label>API Rico (Vérification présence)</label>
+            <input type="text" id="p-rico-url" value="http://localhost:3000">
+          </div>
+          <div class="form-group">
+            <label>TMDB Bearer Token</label>
+            <input type="password" id="p-tmdb-token" placeholder="Bearer eyJ...">
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="checkbox-group">
+            <input type="checkbox" id="p-headless">
+            <span>Mode sans interface (Headless)</span>
+          </label>
+        </div>
+        
+        <div style="display: flex; gap: 12px; margin-top: 12px;">
+          <button id="btn-start" class="btn btn-primary">🚀 Démarrer le scraping</button>
+          <button id="btn-stop" class="btn btn-danger" disabled>🛑 Arrêter</button>
+          <span id="job-badge" class="user-badge" style="display:none; background: rgba(59, 130, 246, 0.2); color: #60a5fa;">Job en cours...</span>
+        </div>
+
+        <div class="log-container" id="progress-log">
+          <div class="log-line">Console de scraping en attente...</div>
+        </div>
       </div>
-      <div class="form-group">
-        <label>Mot de passe</label>
-        <input id="t-pass" type="password">
+    </section>
+
+    <!-- TAB 2 : RAPPORTS -->
+    <section id="tab-reports" class="tab-pane">
+      <div class="card">
+        <div class="report-selector">
+          <label style="margin-bottom:0;">Sélectionner un rapport :</label>
+          <select id="select-report" style="width: auto; min-width: 280px;"></select>
+          <button id="btn-refresh-reports" class="btn btn-outline btn-sm">🔄 Actualiser</button>
+        </div>
+        <iframe id="report-frame" src="about:blank"></iframe>
       </div>
-      <div class="form-group full">
-        <label>Dossier de destination</label>
-        <input id="t-dir" type="text" placeholder="/home/streaming/films">
+    </section>
+
+    <!-- TAB 3 : TRANSMISSION -->
+    <section id="tab-transmission" class="tab-pane">
+      <div class="card">
+        <h2>Connexion Transmission</h2>
+        <div class="grid-2" style="margin-top: 16px;">
+          <div class="form-group">
+            <label>URL du serveur Transmission RPC</label>
+            <input type="text" id="t-url" placeholder="http://ricohoho.fr:9091">
+          </div>
+          <div class="form-group">
+            <label>Dossier de destination sur le serveur</label>
+            <input type="text" id="t-dir" placeholder="/home/streaming/films">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="form-group">
+            <label>Utilisateur RPC</label>
+            <input type="text" id="t-user" placeholder="transmission">
+          </div>
+          <div class="form-group">
+            <label>Mot de passe RPC</label>
+            <input type="password" id="t-pass">
+          </div>
+        </div>
+        <button id="btn-test-trans" class="btn btn-outline" style="margin-bottom: 24px;">🧪 Test de connexion</button>
+        
+        <h2>Films prêts à être envoyés</h2>
+        <div id="trans-films-list" style="margin-top: 12px; margin-bottom: 16px;">
+          <p style="color: var(--muted); font-size: 0.9rem;">Chargement des films sélectionnés...</p>
+        </div>
+        <button id="btn-send-trans" class="btn btn-primary" disabled>📡 Envoyer les torrents vers Transmission</button>
       </div>
-    </div>
-    <button id="btn-test-trans" class="btn btn-secondary">🔌 Tester la connexion</button>
+    </section>
   </div>
 
-  <div class="section">
-    <h2>Films sélectionnés</h2>
-    <button id="btn-refresh-trans" class="btn btn-secondary" style="margin-bottom:.75rem">↺ Actualiser depuis le rapport actif</button>
-    <div id="trans-films-list"><span class="log-dim">Aucun film sélectionné.</span></div>
-    <br>
-    <button id="btn-send-trans" class="btn btn-primary" disabled>📡 Envoyer vers Transmission</button>
-  </div>
-</section>
+  <div id="toast"></div>
 
-<div id="toast"></div>
+  <script>
+    // ─── Gestion de l'authentification JWT ──────────────────────────────────
+    function getToken() { return localStorage.getItem('torrent_scraper_token') || ''; }
+    function setToken(t) { localStorage.setItem('torrent_scraper_token', t); }
+    function clearToken() { localStorage.removeItem('torrent_scraper_token'); }
 
-<script>
-// ─── Toast ───────────────────────────────────────────────────────────────────
-const toast = document.getElementById('toast');
-let _toastTimer = null;
-function showToast(msg, type = 'ok') {
-  toast.textContent = msg;
-  toast.className = type + ' show';
-  clearTimeout(_toastTimer);
-  _toastTimer = setTimeout(() => { toast.className = type; }, 2500);
-}
+    const loginModal = document.getElementById('login-modal');
+    const loginError = document.getElementById('login-error');
+    const userBadge  = document.getElementById('user-badge');
+    const loggedUser = document.getElementById('logged-user');
 
-// ─── Tabs ────────────────────────────────────────────────────────────────────
-document.querySelectorAll('.tab-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-    btn.classList.add('active');
-    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-    if (btn.dataset.tab === 'films') loadReports();
-    if (btn.dataset.tab === 'transmission') refreshTransFilms();
-  });
-});
-
-// ─── Init form fields depuis /api/config ─────────────────────────────────────
-fetch('/api/config').then(r => r.json()).then(cfg => {
-  document.getElementById('p-base-url').value   = cfg.base_url    || '';
-  document.getElementById('p-max-films').value  = cfg.max_films   || '';
-  document.getElementById('p-max-size').value   = cfg.max_size_gb || '';
-  document.getElementById('p-years').value      = cfg.years       || '';
-  document.getElementById('p-output-dir').value = cfg.output_dir  || '';
-  document.getElementById('p-rico-url').value   = cfg.rico_api_url      || '';
-  document.getElementById('p-tmdb-token').value = cfg.tmdb_bearer_token || '';
-  document.getElementById('p-tmdb-key').value   = cfg.tmdb_api_key      || '';
-  document.getElementById('p-headless').checked = !!cfg.headless;
-  document.getElementById('t-url').value        = cfg.transmission_url  || '';
-  document.getElementById('t-user').value       = cfg.transmission_user || '';
-  document.getElementById('t-pass').value       = cfg.transmission_pass || '';
-  document.getElementById('t-dir').value        = cfg.transmission_dir  || '';
-}).catch(err => console.error('Chargement config :', err));
-
-// ─── Scraping ────────────────────────────────────────────────────────────────
-const logEl   = document.getElementById('progress-log');
-const badge   = document.getElementById('job-badge');
-const btnStart = document.getElementById('btn-start');
-const btnStop  = document.getElementById('btn-stop');
-
-function appendLog(text, cls = 'log-info') {
-  const line = document.createElement('div');
-  line.className = 'log-line ' + cls;
-  line.textContent = text;
-  logEl.appendChild(line);
-  logEl.scrollTop = logEl.scrollHeight;
-}
-
-function setJobRunning(running) {
-  btnStart.disabled = running;
-  btnStop.style.display = running ? 'inline-flex' : 'none';
-  badge.className = 'badge ' + (running ? 'badge-running' : 'badge-idle');
-  badge.textContent = running ? 'En cours…' : 'Inactif';
-}
-
-let _evtSource = null;
-
-btnStart.addEventListener('click', async () => {
-  logEl.innerHTML = '';
-  setJobRunning(true);
-  appendLog('Démarrage du scraping…', 'log-dim');
-
-  const body = {
-    base_url:          document.getElementById('p-base-url').value,
-    max_films:         document.getElementById('p-max-films').value,
-    years:             document.getElementById('p-years').value,
-    max_size_gb:       document.getElementById('p-max-size').value,
-    output_dir:        document.getElementById('p-output-dir').value,
-    headless:          document.getElementById('p-headless').checked,
-    rico_api_url:      document.getElementById('p-rico-url').value,
-    tmdb_bearer_token: document.getElementById('p-tmdb-token').value,
-    tmdb_api_key:      document.getElementById('p-tmdb-key').value,
-  };
-
-  const r = await fetch('/api/scrape/start', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
-  });
-
-  if (!r.ok) {
-    const err = await r.json();
-    appendLog('Erreur : ' + err.error, 'log-err');
-    setJobRunning(false);
-    return;
-  }
-
-  if (_evtSource) _evtSource.close();
-  _evtSource = new EventSource('/api/scrape/progress');
-  _evtSource.onmessage = e => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'ping') return;
-    if (msg.type === 'browser_launched')  appendLog('Navigateur lancé', 'log-info');
-    else if (msg.type === 'films_found')  appendLog(`${msg.count} films trouvés — ${msg.selected} retenus`, 'log-info');
-    else if (msg.type === 'report_saved') appendLog('Rapport JSON créé', 'log-dim');
-    else if (msg.type === 'torrent_ok')   appendLog(`✓ [${msg.index}/${msg.total}] ${msg.title}  ${msg.size}`, 'log-ok');
-    else if (msg.type === 'torrent_error')appendLog(`✗ [${msg.index}/${msg.total}] ${msg.title} — ${msg.error}`, 'log-err');
-    else if (msg.type === 'scrape_done')  appendLog(`Scraping terminé — ${msg.downloaded} torrent(s) téléchargé(s)`, 'log-info');
-    else if (msg.type === 'enriching')    appendLog(msg.message, 'log-dim');
-    else if (msg.type === 'all_done') {
-      badge.className = 'badge badge-done';
-      badge.textContent = 'Terminé';
-      appendLog(`✅ Terminé — rapport : ${msg.report}`, 'log-ok');
-      showToast('Scraping + enrichissement terminés !');
-      setJobRunning(false);
-      _evtSource.close();
-      _lastReport = msg.report;
-    } else if (msg.type === 'error') {
-      appendLog('Erreur : ' + msg.message, 'log-err');
-      setJobRunning(false);
-      _evtSource.close();
+    function showLoginModal() {
+      loginError.style.display = 'none';
+      loginModal.classList.add('active');
+      userBadge.style.display = 'none';
     }
-  };
-  _evtSource.onerror = () => {
-    if (_evtSource.readyState === EventSource.CLOSED) return;
-    appendLog('Connexion SSE interrompue', 'log-err');
-    setJobRunning(false);
-  };
-});
 
-// ─── Films ───────────────────────────────────────────────────────────────────
-const reportSel = document.getElementById('report-select');
-const filmsFrame = document.getElementById('films-frame');
-let _lastReport = null;
-
-async function loadReports() {
-  const r = await fetch('/api/reports');
-  const data = await r.json();
-  reportSel.innerHTML = '<option value="">— Sélectionner un rapport —</option>';
-  data.forEach(f => {
-    const opt = document.createElement('option');
-    opt.value = f.name;
-    opt.textContent = f.name + (f.active ? ' ✦' : '');
-    if (f.active) opt.selected = true;
-    reportSel.appendChild(opt);
-  });
-  if (_lastReport) {
-    reportSel.value = _lastReport;
-  }
-}
-
-document.getElementById('btn-load-report').addEventListener('click', () => {
-  const name = reportSel.value;
-  if (!name) { showToast('Sélectionnez un rapport', 'error'); return; }
-  filmsFrame.src = '/films/' + encodeURIComponent(name);
-  _lastReport = name;
-});
-
-document.getElementById('btn-refresh-reports').addEventListener('click', loadReports);
-
-// ─── Transmission ────────────────────────────────────────────────────────────
-const transListEl = document.getElementById('trans-films-list');
-const btnSendTrans = document.getElementById('btn-send-trans');
-let _transFilms = [];
-
-async function refreshTransFilms() {
-  const r = await fetch('/api/reports');
-  const reports = await r.json();
-  const active = reports.find(f => f.active);
-  if (!active) {
-    transListEl.innerHTML = `<span class="log-dim">Aucun rapport actif. Ouvrez un rapport dans l'onglet Films.</span>`;
-    btnSendTrans.disabled = true;
-    _transFilms = [];
-    return;
-  }
-  // Lire le JSON directement via /films/<name> retourne du HTML — on va chercher le JSON via une autre route
-  const cfgR = await fetch('/api/report-json/' + encodeURIComponent(active.name));
-  if (!cfgR.ok) { _transFilms = []; return; }
-  const data = await cfgR.json();
-  _transFilms = (data.Fichiers || []).filter(f => f.selectionne && f.torrent_ok);
-  const sans_torrent = (data.Fichiers || []).filter(f => f.selectionne && !f.torrent_ok);
-  renderTransFilms(sans_torrent);
-}
-
-function renderTransFilms(sans_torrent = []) {
-  transListEl.innerHTML = '';
-  sans_torrent.forEach(f => {
-    const div = document.createElement('div');
-    div.className = 'trans-film trans-film-missing';
-    div.innerHTML = `<span class="name">${f.film || f.Fichier} (${f.annee || '?'})</span><span class="status" style="color:#f87171">⚠ .torrent non téléchargé</span>`;
-    transListEl.appendChild(div);
-  });
-  if (!_transFilms.length) {
-    if (!sans_torrent.length) transListEl.innerHTML = '<span class="log-dim">Aucun film sélectionné dans le rapport actif.</span>';
-    btnSendTrans.disabled = true;
-    return;
-  }
-  _transFilms.forEach(f => {
-    const div = document.createElement('div');
-    div.className = 'trans-film';
-    div.dataset.film = f.film || f.Fichier;
-    div.innerHTML = `<span class="name">${f.film || f.Fichier} (${f.annee || '?'})</span><span class="status">${f.Taille || ''}</span>`;
-    transListEl.appendChild(div);
-  });
-  btnSendTrans.disabled = false;
-}
-
-document.getElementById('btn-refresh-trans').addEventListener('click', refreshTransFilms);
-
-document.getElementById('btn-test-trans').addEventListener('click', async () => {
-  const params = new URLSearchParams({
-    url:  document.getElementById('t-url').value,
-    user: document.getElementById('t-user').value,
-    pass: document.getElementById('t-pass').value,
-  });
-  const r = await fetch('/api/transmission/test?' + params);
-  const d = await r.json();
-  showToast(d.message, d.ok ? 'ok' : 'error');
-});
-
-btnSendTrans.addEventListener('click', async () => {
-  if (!_transFilms.length) return;
-  btnSendTrans.disabled = true;
-  const films = _transFilms.map(f => f.film || f.Fichier);
-  const body = {
-    url:   document.getElementById('t-url').value,
-    user:  document.getElementById('t-user').value,
-    pass:  document.getElementById('t-pass').value,
-    dir:   document.getElementById('t-dir').value,
-    films: films,
-  };
-  const r = await fetch('/api/transmission/send', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
-  });
-  const data = await r.json();
-  data.results.forEach(res => {
-    const el = transListEl.querySelector(`[data-film="${CSS.escape(res.film)}"]`);
-    if (el) {
-      el.classList.add(res.ok ? 'sent' : 'error');
-      el.querySelector('.status').textContent = res.ok ? '✓ Envoyé' : '✗ ' + res.error;
+    function hideLoginModal(username) {
+      loginModal.classList.remove('active');
+      loggedUser.textContent = username || 'admin';
+      userBadge.style.display = 'inline-flex';
     }
-  });
-  const ok = data.results.filter(r => r.ok).length;
-  showToast(`${ok}/${data.results.length} torrent(s) envoyé(s)`, ok === data.results.length ? 'ok' : 'error');
-  btnSendTrans.disabled = false;
-});
-</script>
+
+    async function apiFetch(url, options = {}) {
+      options.headers = options.headers || {};
+      const token = getToken();
+      if (token) {
+        options.headers['Authorization'] = 'Bearer ' + token;
+      }
+      const response = await fetch(url, options);
+      if (response.status === 401 && !url.includes('/api/login')) {
+        showLoginModal();
+        throw new Error('Authentification requise (401)');
+      }
+      return response;
+    }
+
+    document.getElementById('form-login').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const user = document.getElementById('login-username').value;
+      const pass = document.getElementById('login-password').value;
+      const submitBtn = document.getElementById('btn-login-submit');
+      
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Vérification...';
+      loginError.style.display = 'none';
+
+      try {
+        const r = await fetch('/api/login', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({username: user, password: pass}),
+        });
+        const data = await r.json();
+        if (data.ok && data.token) {
+          setToken(data.token);
+          hideLoginModal(data.username);
+          showToast('Connexion réussie !', 'ok');
+          loadConfig();
+          loadReports();
+        } else {
+          loginError.textContent = data.error || 'Identifiants invalides';
+          loginError.style.display = 'block';
+        }
+      } catch (err) {
+        loginError.textContent = 'Erreur lors de la connexion au serveur';
+        loginError.style.display = 'block';
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Se connecter 🚀';
+      }
+    });
+
+    document.getElementById('btn-logout').addEventListener('click', () => {
+      clearToken();
+      showToast('Déconnecté', 'ok');
+      showLoginModal();
+    });
+
+    async function checkAuthStatus() {
+      const token = getToken();
+      if (!token) {
+        showLoginModal();
+        return;
+      }
+      try {
+        const r = await apiFetch('/api/me');
+        const d = await r.json();
+        if (d.authenticated) {
+          hideLoginModal(d.username);
+          loadConfig();
+          loadReports();
+        } else {
+          showLoginModal();
+        }
+      } catch (err) {
+        showLoginModal();
+      }
+    }
+
+    // ─── Toast UI ────────────────────────────────────────────────────────────
+    function showToast(msg, type = 'ok') {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.className = 'show ' + type;
+      setTimeout(() => { t.className = ''; }, 3500);
+    }
+
+    // ─── Tabs Navigation ─────────────────────────────────────────────────────
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+        if (btn.dataset.tab === 'transmission') refreshTransFilms();
+      });
+    });
+
+    // ─── Configuration ───────────────────────────────────────────────────────
+    function loadConfig() {
+      apiFetch('/api/config')
+        .then(r => r.json())
+        .then(cfg => {
+          document.getElementById('p-base-url').value   = cfg.base_url   || '';
+          document.getElementById('p-max-films').value  = cfg.max_films  || 100;
+          document.getElementById('p-years').value      = cfg.years      || '';
+          document.getElementById('p-output-dir').value = cfg.output_dir  || '';
+          document.getElementById('p-rico-url').value   = cfg.rico_api_url      || '';
+          document.getElementById('p-tmdb-token').value = cfg.tmdb_bearer_token || '';
+          document.getElementById('p-headless').checked = !!cfg.headless;
+          document.getElementById('t-url').value        = cfg.transmission_url  || '';
+          document.getElementById('t-user').value       = cfg.transmission_user || '';
+          document.getElementById('t-pass').value       = cfg.transmission_pass || '';
+          document.getElementById('t-dir').value        = cfg.transmission_dir  || '';
+        })
+        .catch(err => console.error('Erreur chargement config :', err));
+    }
+
+    // ─── Scraping ────────────────────────────────────────────────────────────
+    const logEl    = document.getElementById('progress-log');
+    const badge    = document.getElementById('job-badge');
+    const btnStart = document.getElementById('btn-start');
+    const btnStop  = document.getElementById('btn-stop');
+
+    function appendLog(text, cls = 'log-info') {
+      const line = document.createElement('div');
+      line.className = 'log-line ' + cls;
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    btnStart.addEventListener('click', async () => {
+      btnStart.disabled = true;
+      btnStop.disabled  = false;
+      badge.style.display = 'inline-flex';
+      logEl.innerHTML = '';
+      appendLog('Démarrage du job...', 'log-info');
+
+      const body = {
+        base_url:          document.getElementById('p-base-url').value,
+        max_films:         document.getElementById('p-max-films').value,
+        years:             document.getElementById('p-years').value,
+        output_dir:        document.getElementById('p-output-dir').value,
+        rico_api_url:      document.getElementById('p-rico-url').value,
+        tmdb_bearer_token: document.getElementById('p-tmdb-token').value,
+        headless:          document.getElementById('p-headless').checked,
+      };
+
+      try {
+        const r = await apiFetch('/api/scrape/start', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(body),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Erreur au démarrage');
+        
+        const token = getToken();
+        const evSource = new EventSource('/api/scrape/progress?token=' + encodeURIComponent(token));
+        evSource.onmessage = (e) => {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'log') {
+            appendLog(msg.text, 'log-' + (msg.level || 'info'));
+          } else if (msg.type === 'all_done') {
+            evSource.close();
+            btnStart.disabled = false;
+            btnStop.disabled  = true;
+            badge.style.display = 'none';
+            showToast('Scraping terminé avec succès !', 'ok');
+            loadReports();
+          } else if (msg.type === 'error') {
+            evSource.close();
+            btnStart.disabled = false;
+            btnStop.disabled  = true;
+            badge.style.display = 'none';
+            showToast('Erreur scraping: ' + msg.error, 'error');
+          }
+        };
+      } catch (err) {
+        appendLog('ERREUR : ' + err.message, 'log-error');
+        btnStart.disabled = false;
+        btnStop.disabled  = true;
+        badge.style.display = 'none';
+      }
+    });
+
+    // ─── Rapports ────────────────────────────────────────────────────────────
+    const selectReports = document.getElementById('select-report');
+    const reportFrame   = document.getElementById('report-frame');
+
+    async function loadReports() {
+      try {
+        const r = await apiFetch('/api/reports');
+        const reports = await r.json();
+        selectReports.innerHTML = '';
+        if (!reports.length) {
+          selectReports.innerHTML = '<option>Aucun rapport disponible</option>';
+          return;
+        }
+        let activeName = '';
+        reports.forEach(rep => {
+          const opt = document.createElement('option');
+          opt.value = rep.name;
+          opt.textContent = rep.name + (rep.active ? ' (Actif)' : '');
+          if (rep.active) { opt.selected = true; activeName = rep.name; }
+          selectReports.appendChild(opt);
+        });
+        if (!activeName && reports.length) activeName = reports[0].name;
+        if (activeName) loadReportFrame(activeName);
+      } catch (err) {
+        console.error('Erreur chargement rapports:', err);
+      }
+    }
+
+    function loadReportFrame(name) {
+      reportFrame.src = '/films/' + encodeURIComponent(name) + '?token=' + encodeURIComponent(getToken());
+    }
+
+    selectReports.addEventListener('change', async () => {
+      const name = selectReports.value;
+      if (!name) return;
+      await apiFetch('/api/report/activate', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: name}),
+      });
+      loadReportFrame(name);
+    });
+
+    document.getElementById('btn-refresh-reports').addEventListener('click', loadReports);
+
+    // ─── Transmission ────────────────────────────────────────────────────────
+    let _transFilms = [];
+    const transListEl  = document.getElementById('trans-films-list');
+    const btnSendTrans = document.getElementById('btn-send-trans');
+
+    async function refreshTransFilms() {
+      transListEl.innerHTML = '<p style="color: var(--muted);">Chargement...</p>';
+      try {
+        const r = await apiFetch('/api/reports');
+        const reports = await r.json();
+        const active = reports.find(r => r.active) || reports[0];
+        if (!active) {
+          transListEl.innerHTML = '<p style="color: var(--muted);">Aucun rapport actif.</p>';
+          btnSendTrans.disabled = true;
+          return;
+        }
+        const rJson = await apiFetch('/api/report-json/' + encodeURIComponent(active.name));
+        const data  = await rJson.json();
+        _transFilms = (data.Fichiers || []).filter(f => f.selectionne);
+        
+        if (!_transFilms.length) {
+          transListEl.innerHTML = '<p style="color: var(--muted);">Aucun film coché "À télécharger" dans le rapport actif.</p>';
+          btnSendTrans.disabled = true;
+          return;
+        }
+
+        transListEl.innerHTML = '';
+        _transFilms.forEach(f => {
+          const name = f.film || f.Fichier;
+          const torrentOk = f.torrent_ok;
+          const div = document.createElement('div');
+          div.style.cssText = 'padding: 8px 12px; background: rgba(15,23,42,0.6); border: 1px solid var(--card-border); border-radius: 6px; margin-bottom: 6px; display: flex; align-items: center; justify-content: space-between; font-size: 0.9rem;';
+          div.dataset.film = name;
+          div.innerHTML = `
+            <span>🎬 <strong>${name}</strong></span>
+            <span class="status" style="color: ${torrentOk ? 'var(--success)' : 'var(--error)'}">
+              ${torrentOk ? '✓ Torrent présent' : '✗ .torrent manquant'}
+            </span>
+          `;
+          transListEl.appendChild(div);
+        });
+        btnSendTrans.disabled = false;
+      } catch (err) {
+        transListEl.innerHTML = '<p style="color: var(--error);">Erreur lors de la récupération des films.</p>';
+      }
+    }
+
+    document.getElementById('btn-test-trans').addEventListener('click', async () => {
+      const params = new URLSearchParams({
+        url:  document.getElementById('t-url').value,
+        user: document.getElementById('t-user').value,
+        pass: document.getElementById('t-pass').value,
+      });
+      try {
+        const r = await apiFetch('/api/transmission/test?' + params);
+        const d = await r.json();
+        showToast(d.message, d.ok ? 'ok' : 'error');
+      } catch (err) {
+        showToast('Erreur test transmission', 'error');
+      }
+    });
+
+    btnSendTrans.addEventListener('click', async () => {
+      if (!_transFilms.length) return;
+      btnSendTrans.disabled = true;
+      const films = _transFilms.map(f => f.film || f.Fichier);
+      const body = {
+        url:   document.getElementById('t-url').value,
+        user:  document.getElementById('t-user').value,
+        pass:  document.getElementById('t-pass').value,
+        dir:   document.getElementById('t-dir').value,
+        films: films,
+      };
+      try {
+        const r = await apiFetch('/api/transmission/send', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(body),
+        });
+        const data = await r.json();
+        (data.results || []).forEach(res => {
+          const el = transListEl.querySelector(`[data-film="${CSS.escape(res.film)}"]`);
+          if (el) {
+            el.querySelector('.status').textContent = res.ok ? '✓ Envoyé' : '✗ ' + res.error;
+            el.querySelector('.status').style.color = res.ok ? 'var(--success)' : 'var(--error)';
+          }
+        });
+        const ok = (data.results || []).filter(r => r.ok).length;
+        showToast(`${ok}/${(data.results || []).length} torrent(s) envoyé(s)`, ok === (data.results || []).length ? 'ok' : 'error');
+      } catch (err) {
+        showToast('Erreur lors de l’envoi des torrents', 'error');
+      } finally {
+        btnSendTrans.disabled = false;
+      }
+    });
+
+    // Démarrage : Vérification de l'authentification
+    checkAuthStatus();
+  </script>
 </body>
-</html>"""
+</html>
+"""
