@@ -221,38 +221,30 @@ def scrape_start():
                 log_cb("Initialisation du scraping...", "info")
                 active_cfg = Settings(**overrides)
 
-                def pipeline_log(msg: str):
-                    log_cb(msg, "info")
+                def pipeline_progress(event: dict):
+                    msg_type = event.get("type", "")
+                    if msg_type == "browser_launched":
+                        log_cb("Lancement du navigateur...", "info")
+                    elif msg_type == "films_found":
+                        log_cb(f"Liste analysée : {event.get('count', 0)} films trouvés, {event.get('selected', 0)} retenus.", "info")
+                    elif msg_type == "report_saved":
+                        log_cb(f"Rapport sauvegardé : {event.get('path')}", "info")
+                    elif msg_type == "torrent_ok":
+                        log_cb(f"[{event.get('index')}/{event.get('total')}] Torrent téléchargé : {event.get('title')}", "success")
+                    elif msg_type == "torrent_error":
+                        log_cb(f"[{event.get('index')}/{event.get('total')}] Échec torrent : {event.get('title')} ({event.get('error')})", "error")
+                    elif msg_type == "scrape_done":
+                        log_cb("Scraping des films terminé.", "success")
 
-                pipeline_run(
-                    base_url=active_cfg.base_url,
-                    list_path=active_cfg.list_path,
-                    years=active_cfg.years,
-                    allowed_domains=active_cfg.allowed_domains,
-                    max_films=active_cfg.max_films,
-                    max_size_gb=active_cfg.max_size_gb,
-                    output_dir=active_cfg.output_dir,
-                    headless=active_cfg.headless,
-                    nav_timeout_ms=active_cfg.nav_timeout_ms,
-                    request_delay_ms=active_cfg.request_delay_ms,
-                    log_cb=pipeline_log,
-                )
+                pipeline_run(settings=active_cfg, progress=pipeline_progress)
 
                 log_cb("Scraping terminé. Recherche du fichier JSON généré...", "info")
                 json_name = _find_latest_json(active_cfg.output_dir)
                 json_path = Path(active_cfg.output_dir) / json_name
                 log_cb(f"Enrichissement du rapport : {json_name}...", "info")
 
-                def enrich_log(msg: str):
-                    log_cb(msg, "info")
-
-                enrich_report(
-                    json_path=json_path,
-                    rico_api_url=active_cfg.rico_api_url,
-                    tmdb_bearer_token=active_cfg.tmdb_bearer_token,
-                    tmdb_api_key=active_cfg.tmdb_api_key,
-                    log_cb=enrich_log,
-                )
+                log_cb("Enrichissement du rapport (Rico & TMDB)...", "info")
+                enrich_report(json_path=json_path, settings=active_cfg)
 
                 _set_active_report(json_path)
                 log_cb(f"Traitement terminé avec succès ! Rapport : {json_name}", "success")
