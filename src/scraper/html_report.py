@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import urllib.parse
 from pathlib import Path
 
 
@@ -38,6 +39,23 @@ def _card(item: dict) -> str:
         poster_html = f'<img class="poster" src="{html.escape(affiche_url)}" alt="Affiche {film}" loading="lazy">'
     else:
         poster_html = '<div class="poster poster-placeholder">🎬</div>'
+
+    # --- Lien TMDB ---
+    film_raw = item.get("film", item.get("Fichier", ""))
+    tmdb_url = item.get("tmdb_url", "")
+    if not tmdb_url:
+        tmdb_id = item.get("tmdb_id")
+        if tmdb_id:
+            tmdb_url = f"https://www.themoviedb.org/movie/{tmdb_id}"
+        elif film_raw:
+            tmdb_url = f"https://www.themoviedb.org/search?query={urllib.parse.quote(film_raw)}"
+        else:
+            tmdb_url = "https://www.themoviedb.org/"
+
+    tmdb_html = (
+        f'<a class="btn-tmdb" href="{html.escape(tmdb_url)}" '
+        f'target="_blank" rel="noopener">🎬 Fiche TMDB</a>'
+    )
 
     # --- Bande annonce ---
     annonce_url = item.get("url_annonce", "")
@@ -97,7 +115,10 @@ def _card(item: dict) -> str:
         {real_html}
         {acteurs_html}
         <div class="card-footer">
-          {annonce_html}
+          <div class="btn-row">
+            {tmdb_html}
+            {annonce_html}
+          </div>
           {tech_html}
         </div>
       </div>
@@ -236,7 +257,14 @@ header p  { color: #6b7280; font-size: 0.9rem; margin-top: .3rem; }
   display: flex;
   align-items: flex-start;
   flex-direction: column;
-  gap: .4rem;
+  gap: .5rem;
+}
+
+.btn-row {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  flex-wrap: wrap;
 }
 
 .btn-trailer {
@@ -251,6 +279,19 @@ header p  { color: #6b7280; font-size: 0.9rem; margin-top: .3rem; }
   transition: background .15s;
 }
 .btn-trailer:hover { background: #6d28d9; }
+
+.btn-tmdb {
+  display: inline-block;
+  background: #01b4e4;
+  color: #0d253f;
+  text-decoration: none;
+  padding: .35rem .9rem;
+  border-radius: 6px;
+  font-size: .82rem;
+  font-weight: 700;
+  transition: background .15s, color .15s;
+}
+.btn-tmdb:hover { background: #0096c7; color: #ffffff; }
 
 .fichier-tech { opacity: .55; font-size: .75rem; }
 .filename { word-break: break-all; color: #8b8baa; }
@@ -325,6 +366,16 @@ _JS = """
     _toastTimer = setTimeout(() => { toast.className = type; }, 2000);
   }
 
+  function getToken() {
+    try {
+      if (window.parent && window.parent.localStorage) {
+        const t = window.parent.localStorage.getItem('torrent_scraper_token');
+        if (t) return t;
+      }
+    } catch (e) {}
+    return new URLSearchParams(window.location.search).get('token') || '';
+  }
+
   // --- Compteur sélectionnés ---
   const statEl = document.querySelector('.stat-select strong');
   function updateCount() {
@@ -343,9 +394,14 @@ _JS = """
       updateCount();
 
       try {
+        const headers = { 'Content-Type': 'application/json' };
+        const token = getToken();
+        if (token) {
+          headers['Authorization'] = 'Bearer ' + token;
+        }
         const r = await fetch('/select', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: headers,
           body: JSON.stringify({ fichier: fichier, selectionne: selectionne }),
         });
         if (!r.ok) throw new Error('HTTP ' + r.status);

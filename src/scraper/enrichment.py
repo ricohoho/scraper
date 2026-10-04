@@ -118,19 +118,46 @@ def _tmdb_base_params(settings: Settings) -> dict:
 
 
 def _find_trailer(videos: list[dict]) -> str:
-    """Cherche une bande-annonce YouTube : français d'abord, puis toute langue."""
-    for lang_filter in ("fr", None):
-        for v in videos:
-            if v.get("site") != "YouTube" or v.get("type") != "Trailer":
-                continue
-            if lang_filter and v.get("iso_639_1") != lang_filter:
-                continue
+    """Cherche une bande-annonce YouTube :
+    1. Trailer en français
+    2. Trailer (toute langue, ex: EN)
+    3. Teaser / Clip / Featurette (français)
+    4. Teaser / Clip / Featurette (toute langue)
+    5. N'importe quelle vidéo YouTube
+    """
+    if not videos:
+        return ""
+
+    # 1. Trailer FR
+    for v in videos:
+        if v.get("site") == "YouTube" and v.get("type") == "Trailer" and v.get("iso_639_1") == "fr" and v.get("key"):
             return f"{_YOUTUBE_URL}{v['key']}"
+
+    # 2. Trailer toute langue
+    for v in videos:
+        if v.get("site") == "YouTube" and v.get("type") == "Trailer" and v.get("key"):
+            return f"{_YOUTUBE_URL}{v['key']}"
+
+    # 3. Teaser / Clip FR
+    for v in videos:
+        if v.get("site") == "YouTube" and v.get("iso_639_1") == "fr" and v.get("type") in ("Teaser", "Clip", "Featurette", "Bande-annonce") and v.get("key"):
+            return f"{_YOUTUBE_URL}{v['key']}"
+
+    # 4. Teaser / Clip toute langue
+    for v in videos:
+        if v.get("site") == "YouTube" and v.get("type") in ("Teaser", "Clip", "Featurette", "Bande-annonce") and v.get("key"):
+            return f"{_YOUTUBE_URL}{v['key']}"
+
+    # 5. Tout clip YouTube
+    for v in videos:
+        if v.get("site") == "YouTube" and v.get("key"):
+            return f"{_YOUTUBE_URL}{v['key']}"
+
     return ""
 
 
 def fetch_tmdb_info(film: str, year: str | None, settings: Settings) -> dict:
-    """Cherche le film sur TMDB et renvoie un dict avec résumé, acteurs, réalisateur, annonce."""
+    """Cherche le film sur TMDB et renvoie un dict avec résumé, acteurs, réalisateur, annonce, fiche TMDB."""
     headers = _tmdb_headers(settings)
     base_params = _tmdb_base_params(settings)
 
@@ -151,16 +178,32 @@ def fetch_tmdb_info(film: str, year: str | None, settings: Settings) -> dict:
         return {}
 
     movie_id = results[0]["id"]
+    tmdb_url = f"https://www.themoviedb.org/movie/{movie_id}"
 
-    # 2. Détails + crédits + vidéos en un seul appel.
-    detail_params = {**base_params, "language": "fr-FR", "append_to_response": "credits,videos"}
+    # 2. Détails + crédits + vidéos en un seul appel (incluant vidéos fr, en et non-spécifiées).
+    detail_params = {
+        **base_params,
+        "language": "fr-FR",
+        "append_to_response": "credits,videos",
+        "include_video_language": "fr,en,null",
+    }
     detail = _http_get(f"{_TMDB_BASE}/movie/{movie_id}", detail_params, headers)
     if not isinstance(detail, dict):
-        return {}
+        return {
+            "tmdb_id": movie_id,
+            "tmdb_url": tmdb_url,
+        }
 
     cast = detail.get("credits", {}).get("cast", [])
     crew = detail.get("credits", {}).get("crew", [])
     videos = detail.get("videos", {}).get("results", [])
+
+    # Si aucune vidéo n'est remontée par append_to_response, tenter un appel dédié /movie/{id}/videos
+    if not videos:
+        v_params = {**base_params, "include_video_language": "fr,en,null"}
+        v_data = _http_get(f"{_TMDB_BASE}/movie/{movie_id}/videos", v_params, headers)
+        if isinstance(v_data, dict):
+            videos = v_data.get("results", [])
 
     directors = [m["name"] for m in crew if m.get("job") == "Director"]
 
@@ -168,6 +211,8 @@ def fetch_tmdb_info(film: str, year: str | None, settings: Settings) -> dict:
     affiche = f"{_TMDB_IMG_BASE}{poster_path}" if poster_path else ""
 
     return {
+        "tmdb_id": movie_id,
+        "tmdb_url": tmdb_url,
         "résume": detail.get("overview", ""),
         "acteurs": [m["name"] for m in cast[:5]],
         "metteur_en_scene": directors[0] if directors else "",
@@ -200,6 +245,8 @@ def enrich_report(json_path: Path, settings: Settings) -> None:
         if not found:
             tmdb = fetch_tmdb_info(film_name, year, settings)
             item.update(tmdb if tmdb else {
+                "tmdb_id": None,
+                "tmdb_url": "",
                 "résume": "",
                 "acteurs": [],
                 "metteur_en_scene": "",
