@@ -13,12 +13,20 @@ vers **Transmission**.
 
 ## Démarrage rapide
 
+### Option A : Python local
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m playwright install chromium   # une seule fois
 cp .env.example .env                    # puis renseigner les tokens TMDB / Transmission
 torrent-dashboard                       # ouvre http://localhost:8765/
+```
+
+### Option B : Docker local (recommandé)
+```bash
+cp .env.example .env                    # Renseigner vos clés dans .env
+chmod +x go-docker.sh
+./go-docker.sh                          # Reconstruit & lance le conteneur sur http://localhost:8765
 ```
 
 ---
@@ -103,9 +111,18 @@ Formulaire pré-rempli depuis `.env`. Cliquer **▶ Lancer le scraping** :
 
 Sélectionner un rapport JSON → les films s'affichent en cartes visuelles :
 - **Bordure verte** : présent sur Rico (titre, année, taille)
-- **Bordure jaune** : absent — affiche TMDB, résumé, acteurs, réalisateur, bouton bande-annonce
+- **Bordure jaune** : absent — affiche TMDB, résumé, acteurs, réalisateur, boutons d'action :
+  - **🎬 Fiche TMDB** : lien direct vers la fiche du film (`https://www.themoviedb.org/movie/{id}`)
+  - **▶ Bande-annonce** : lien YouTube (recherche multilingue FR/VO avec repli intelligent sur teasers/clips si pas de trailer FR)
 
-Cocher un film → `"selectionne": true` sauvegardé immédiatement dans le JSON.
+Cocher un film → `"selectionne": true` sauvegardé immédiatement dans le JSON via l'API sécurisée.
+
+### 🔐 Authentification & Sécurité
+
+L'application intègre une authentification par jeton **JWT** :
+- Connexion via la modale de login sur le dashboard (`/api/login`)
+- En-tête `Authorization: Bearer <token>` requis pour les APIs sécurisées (`/api/scrape/start`, `/api/transmission/send`, `/select`, etc.)
+- Voir [doc/AUTHENTICATION_JWT.md](doc/AUTHENTICATION_JWT.md) pour les détails d'implémentation.
 
 ### Onglet 📡 Transmission
 

@@ -80,9 +80,9 @@ flowchart TD
 - **`serve_cli.py` (`torrent-serve`)** : Commande CLI pour visualiser un rapport de scraping existant via un serveur HTTP simple (`server.py`).
 
 ### 2. Application Web & Rendu (`webapp.py`, `server.py`, `html_report.py`)
-- **`webapp.py`** : Application Flask complète (11 routes HTTP, Server-Sent Events pour le progrès en temps réel, intégration RPC Transmission). Il lance le scraping dans un thread d'arrière-plan synchrone.
+- **`webapp.py`** : Application Flask complète (routes HTTP sécurisées JWT, Server-Sent Events pour le progrès en temps réel, intégration RPC Transmission). Il inclut l'écran de login et orchestre le scraping.
 - **`server.py`** : Serveur HTTP léger basé sur la bibliothèque standard (`http.server`) utilisé par `torrent-serve`.
-- **`html_report.py`** : Génère le code HTML/CSS/JS autonome pour afficher la vue interactive des films.
+- **`html_report.py`** : Génère le code HTML/CSS/JS autonome pour afficher la vue interactive des films (boutons `🎬 Fiche TMDB` et `▶ Bande-annonce`, checkboxes de sélection avec transmission du jeton JWT).
 
 ### 3. Orchestration & Traitement (`pipeline.py`, `enrichment.py`, `report.py`)
 - **`pipeline.py`** : Orchestre le processus complet :
@@ -91,7 +91,7 @@ flowchart TD
   3. Télécharge les fichiers `.torrent` en utilisant `naming.py` pour sécuriser les noms.
   4. Génère le rapport JSON brut via `report.py`.
   5. Appelle `enrichment.py` pour ajouter les données TMDB et Rico.
-- **`enrichment.py`** : Interroge l'API TMDB (Bearer Token) pour récupérer l'affiche, la note et la description, et vérifie auprès du serveur Rico si le film est déjà présent dans votre médiathèque locale.
+- **`enrichment.py`** : Interroge l'API TMDB (Bearer Token) pour récupérer l'affiche, le résumé, le réalisateur, les acteurs, l'ID/URL TMDB (`tmdb_url`) et la bande-annonce YouTube (recherche incluant FR, EN etVO avec repli automatique). Vérifie également la présence sur le webservice local Rico.
 - **`report.py`** : Fonctions de sauvegarde et chargement des fichiers JSON horodatés dans le dossier `downloads/`.
 
 ### 4. Navigateur & DOM (`browser.py`, `parsing.py`, `naming.py`)

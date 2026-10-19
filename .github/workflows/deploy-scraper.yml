@@ -91,8 +91,8 @@ jobs:
             echo "==> Starting new torrent-scraper container..."
             docker run -d \
               --name torrent-scraper \
+              --network ricofilm-network \
               --restart unless-stopped \
-              -p 8765:8765 \
               -v ~/torrent-scraper/downloads:/app/downloads \
               -e SCRAPER_HEADLESS=true \
               -e SCRAPER_TMDB_BEARER_TOKEN="${{ secrets.SCRAPER_TMDB_BEARER_TOKEN }}" \
