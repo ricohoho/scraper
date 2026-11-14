@@ -93,6 +93,8 @@ jobs:
               --name torrent-scraper \
               --network ricofilm-network \
               --restart unless-stopped \
+              --dns 1.1.1.1 \
+              --dns 8.8.8.8 \
               -v ~/torrent-scraper/downloads:/app/downloads \
               -e SCRAPER_HEADLESS=true \
               -e SCRAPER_TMDB_BEARER_TOKEN="${{ secrets.SCRAPER_TMDB_BEARER_TOKEN }}" \

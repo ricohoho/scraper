@@ -41,6 +41,8 @@ echo "==> [4/4] Starting container '$CONTAINER_NAME'..."
 docker run -d \
   --name "$CONTAINER_NAME" \
   --restart unless-stopped \
+  --dns 1.1.1.1 \
+  --dns 8.8.8.8 \
   -p "${PORT}:8765" \
   -v "$DOWNLOADS_DIR:/app/downloads" \
   "${ENV_OPTION[@]}" \
