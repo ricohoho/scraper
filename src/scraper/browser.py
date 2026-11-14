@@ -219,23 +219,22 @@ def goto_and_wait(surface: Surface, url: str, settings: Settings, ready_selector
 
     Lève ``PlaywrightTimeoutError`` / ``PlaywrightError`` si la liste n'arrive jamais.
     """
-    deadline = time.monotonic() + settings.nav_timeout_ms / 1000
+    # 1. Navigation initiale vers l'URL (avec retry sur erreur réseau)
     network_errors = 0
-    last_error: PlaywrightError | None = None
-
-    while time.monotonic() < deadline:
+    while True:
         try:
             surface.goto(url, wait_until="domcontentloaded", timeout=settings.nav_timeout_ms)
-            network_errors = 0
+            break
         except PlaywrightError as exc:
             network_errors += 1
-            last_error = exc
             if network_errors >= 3:
                 raise PlaywrightError(f"Navigation vers {url} impossible : {exc}") from exc
             logger.debug("Navigation interrompue (%s), nouvelle tentative…", exc)
             surface.wait_for_timeout(1_000)
-            continue
 
+    # 2. Attente de l'élément utile (laisse le temps au challenge Cloudflare sans recharger la page en boucle)
+    deadline = time.monotonic() + settings.nav_timeout_ms / 1000
+    while time.monotonic() < deadline:
         try:
             surface.wait_for_selector(ready_selector, timeout=3_000, state="attached")
             return  # page utile prête
@@ -247,4 +246,4 @@ def goto_and_wait(surface: Surface, url: str, settings: Settings, ready_selector
                 surface.wait_for_timeout(1_000)  # laisser le DOM se peupler
 
     # Dernière tentative explicite pour produire une erreur claire si ça échoue.
-    surface.wait_for_selector(ready_selector, timeout=settings.nav_timeout_ms, state="attached")
+    surface.wait_for_selector(ready_selector, timeout=3_000, state="attached")

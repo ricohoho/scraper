@@ -83,7 +83,14 @@ def _collect_films(surface: Surface, settings: Settings) -> list[Film]:
 
     while url and url not in visited and len(films) < settings.max_films:
         visited.add(url)
-        goto_and_wait(surface, url, settings, parsing.LIST_READY_SELECTOR)
+        # Évite un rechargement immédiat si la surface est déjà sur l'URL de la liste
+        # et que le tableau des films est déjà chargé dans le DOM (évite l'anti-bot Cloudflare).
+        already_loaded = (
+            surface.url.rstrip("/") == url.rstrip("/")
+            and surface.query_selector(parsing.LIST_READY_SELECTOR) is not None
+        )
+        if not already_loaded:
+            goto_and_wait(surface, url, settings, parsing.LIST_READY_SELECTOR)
         page_films = parsing.extract_films(surface)
         logger.info("Page liste : %d films extraits (%s)", len(page_films), surface.url)
         if not page_films:
