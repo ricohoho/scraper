@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     ca-certificates \
     git \
+    libatomic1 \
     && rm -rf /var/lib/apt-get/lists/*
 
 # Copy project specification and application source code
